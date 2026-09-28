@@ -166,7 +166,7 @@ elasticsearch:
 opensearch:
   image:
     repository: opensearchproject/opensearch
-    tag: 2.19.1
+    tag: 3.8.0
     pullPolicy: IfNotPresent
     pullSecrets: []
   initContainers:

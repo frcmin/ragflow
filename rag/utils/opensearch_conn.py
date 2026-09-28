@@ -61,6 +61,25 @@ if (nw <= 0.0) {
 logger = logging.getLogger("ragflow.opensearch_conn")
 
 
+def _client_payload(value):
+    """Normalize opensearch-py responses.
+
+    2.7 returns plain dicts. 3.x still returns dicts from the transport, and
+    some call paths expose an object whose JSON body lives on ``.body``.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    body = getattr(value, "body", None)
+    if isinstance(body, dict):
+        return body
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        return {}
+
+
 @singleton
 class OSConnection(DocStoreConnection):
     def __init__(self):
@@ -75,7 +94,7 @@ class OSConnection(DocStoreConnection):
                     timeout=600,
                 )
                 if self.os:
-                    self.info = self.os.info()
+                    self.info = _client_payload(self.os.info())
                     break
             except Exception as e:
                 logger.warning(f"{str(e)}. Waiting OpenSearch {settings.OS['hosts']} to be healthy.")
@@ -160,7 +179,7 @@ class OSConnection(DocStoreConnection):
         return "opensearch"
 
     def health(self) -> dict:
-        health_dict = dict(self.os.cluster.health())
+        health_dict = dict(_client_payload(self.os.cluster.health()))
         health_dict["type"] = "opensearch"
         return health_dict
 
@@ -843,6 +862,22 @@ class OSConnection(DocStoreConnection):
     SQL
     """
 
+    def _sql_client(self):
+        """Return the SQL plugin client.
+
+        opensearch-py 3.x moved SqlClient under ``client.plugins`` and copies
+        it onto the root client when the attribute is free. Prefer the root
+        alias, then the plugin namespace.
+        """
+        sql_api = getattr(self.os, "sql", None)
+        if sql_api is not None and hasattr(sql_api, "query"):
+            return sql_api
+        plugins = getattr(self.os, "plugins", None)
+        sql_api = getattr(plugins, "sql", None)
+        if sql_api is None or not hasattr(sql_api, "query"):
+            raise AttributeError("OpenSearch client has no SQL plugin API (expected client.sql or client.plugins.sql)")
+        return sql_api
+
     def sql(self, sql: str, fetch_size: int, format: str):
         logger.debug(f"OSConnection.sql get sql: {sql}")
         sql = re.sub(r"[ `]+", " ", sql)
@@ -859,7 +894,7 @@ class OSConnection(DocStoreConnection):
 
         for i in range(ATTEMPT_TIME):
             try:
-                res = self.os.sql.query(body={"query": sql, "fetch_size": fetch_size}, format=format, request_timeout="2s")
+                res = _client_payload(self._sql_client().query(body={"query": sql, "fetch_size": fetch_size}, format=format, request_timeout="2s"))
                 return res
             except ConnectionTimeout:
                 logger.exception("OSConnection.sql timeout")
