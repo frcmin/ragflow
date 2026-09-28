@@ -13,23 +13,18 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-"""Internal canvas runner used by cmd/qnzsagentbot.
+"""Internal entry that runs qnzs_completion for the Go agent-bot service.
 
-The public OpenAI-compatible endpoint lives in the Go service. This route
-only executes an already-authorized canvas: it loads ``user_canvas`` (the
-table the custom QNZSUserCanvasService reads), checks ``user_id == tenant_id``,
-resets the canvas, applies ``dialog`` as history, and streams canvas events.
+The Go process authenticates the caller and suffixes session_id. This route
+forwards the remaining JSON fields as kwargs. It does not call
+canvas_service.completion.
 """
 import hmac
-import json
-import logging
 import os
 
 from quart import Blueprint, Response, jsonify, request
 
-from api.qnzs.dialog import normalize_dialog
-
-logger = logging.getLogger(__name__)
+from api.db.services.qnzs_canvas_service import qnzs_completion
 
 bp = Blueprint("qnzs_canvas_exec", __name__)
 
@@ -53,56 +48,32 @@ async def run_canvas():
     if not isinstance(payload, dict):
         return jsonify({"code": 102, "message": "JSON body is required"}), 400
 
-    tenant_id = payload.get("tenant_id") or ""
-    agent_id = payload.get("agent_id") or ""
+    tenant_id = payload.pop("tenant_id", "") or ""
+    agent_id = payload.pop("agent_id", "") or ""
+    session_id = payload.pop("session_id", None)
     if not tenant_id or not agent_id:
         return jsonify({"code": 102, "message": "tenant_id and agent_id are required"}), 400
 
+    generator = qnzs_completion(tenant_id, agent_id, session_id=session_id, **payload)
     try:
-        dialog_turns = normalize_dialog(payload.get("dialog")) if "dialog" in payload else None
-    except ValueError as exc:
+        first = await anext(generator)
+    except StopAsyncIteration:
+        first = None
+    except AssertionError as exc:
+        await generator.aclose()
         return jsonify({"code": 102, "message": str(exc)}), 400
-
-    from agent.canvas import Canvas
-    from api.db.services.canvas_service import UserCanvasService
-    from common.misc_utils import get_uuid, thread_pool_exec
-
-    exists, cvs = await thread_pool_exec(UserCanvasService.get_by_id, agent_id)
-    if not exists or cvs is None:
-        return jsonify({"code": 102, "message": "Agent not found."}), 400
-    if getattr(cvs, "user_id", None) != tenant_id:
-        return jsonify({"code": 102, "message": "You do not own the agent."}), 400
-
-    dsl = cvs.dsl
-    if not isinstance(dsl, str):
-        dsl = json.dumps(dsl, ensure_ascii=False)
-    session_id = payload.get("session_id") or get_uuid()
-    # Match the reference call: Canvas(dsl, tenant_id, agent_id) binds agent_id
-    # as task_id, not canvas_id.
-    canvas = Canvas(dsl, tenant_id, agent_id)
-    canvas.reset()
-    if dialog_turns is not None:
-        canvas.history = []
-        for role, content in dialog_turns:
-            canvas.history.append((role, content))
-
-    query = payload.get("query") or payload.get("question") or ""
-    user_id = payload.get("user_id") or ""
-    inputs = payload.get("inputs") or {}
+    except Exception as exc:
+        await generator.aclose()
+        return jsonify({"code": 102, "message": str(exc) or "Unknown error"}), 400
 
     async def stream():
         try:
-            async for ans in canvas.run(query=query, files=[], user_id=user_id, inputs=inputs, session_id=session_id):
-                if isinstance(ans, dict):
-                    ans["session_id"] = session_id
-                yield "data: " + json.dumps(ans, ensure_ascii=False) + "\n\n"
-        except Exception as exc:
-            logger.exception("qnzs canvas run failed session_id=%s", session_id)
-            yield "data: " + json.dumps({"event": "error", "data": {"content": str(exc) or "Unknown error"}, "session_id": session_id}, ensure_ascii=False) + "\n\n"
+            if first is not None:
+                yield first
+            async for chunk in generator:
+                yield chunk
         finally:
-            close = getattr(canvas, "close", None)
-            if callable(close):
-                close()
+            await generator.aclose()
 
     resp = Response(stream(), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache"

@@ -109,6 +109,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, dataError("canvas executor is not configured"))
 		return
 	}
+	rawBody := cloneBody(body)
+	rawBody["session_id"] = sessionID
 	contents, err := s.Runner.Run(r.Context(), RunRequest{
 		TenantID:  tenantID,
 		AgentID:   agentID,
@@ -118,6 +120,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		Inputs:    MapBeginInputs(BeginInputSchema(canvas.DSL), body),
 		Dialog:    dialog,
 		HasDialog: hasDialog,
+		Raw:       rawBody,
 	})
 	if err != nil {
 		writeAPIError(w, err)
@@ -194,6 +197,14 @@ func readBody(r *http.Request) (map[string]any, error) {
 
 func bytesTrim(raw []byte) []byte {
 	return []byte(strings.TrimSpace(string(raw)))
+}
+
+func cloneBody(body map[string]any) map[string]any {
+	cloned := make(map[string]any, len(body)+1)
+	for key, value := range body {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func writeAPIError(w http.ResponseWriter, err error) {

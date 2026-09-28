@@ -123,6 +123,16 @@ func TestHandlerStreamAndMapping(t *testing.T) {
 	if runner.req.SessionID != "from-header-agent-1" || runner.req.TenantID != "tenant-1" || runner.req.Query != "问题" {
 		t.Fatalf("run request: %+v", runner.req)
 	}
+	if runner.req.Raw["session_id"] != "from-header-agent-1" || runner.req.Raw["query"] != "问题" {
+		t.Fatalf("raw kwargs: %#v", runner.req.Raw)
+	}
+	if _, ok := runner.req.Raw["inputs"]; ok {
+		t.Fatal("raw kwargs must not gain a Go inputs map")
+	}
+	customer, _ := runner.req.Raw["customer"].(map[string]any)
+	if customer["name"] != "张三" {
+		t.Fatalf("raw customer: %#v", runner.req.Raw["customer"])
+	}
 	if runner.req.Inputs["customer.name"].Value != "张三" || runner.req.Inputs["dialog"].Value != "" {
 		t.Fatalf("inputs: %+v", runner.req.Inputs)
 	}
@@ -160,6 +170,9 @@ func TestHandlerNonStream(t *testing.T) {
 	}
 	if runner.req.SessionID != "s1-agent-1" || runner.req.Query != "q" {
 		t.Fatalf("run: %+v", runner.req)
+	}
+	if runner.req.Raw["session_id"] != "s1-agent-1" || runner.req.Raw["question"] != "q" || runner.req.Raw["stream"] != false {
+		t.Fatalf("raw: %#v", runner.req.Raw)
 	}
 }
 
@@ -207,6 +220,82 @@ func TestReadMessageContents(t *testing.T) {
 	<-done
 	if strings.Join(got, "") != "你好" {
 		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestReadOpenAIChunks(t *testing.T) {
+	raw := "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"故宫\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"content\":\"ignored\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"在北京\"}}]}\n\n"
+	out := make(chan string, 4)
+	if err := readMessageContents(context.Background(), strings.NewReader(raw), out); err != nil {
+		t.Fatal(err)
+	}
+	close(out)
+	var got []string
+	for content := range out {
+		got = append(got, content)
+	}
+	if strings.Join(got, "") != "故宫在北京" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestHTTPCanvasRunnerForwardsRawKwargs(t *testing.T) {
+	var got map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-QNZS-Internal-Token") != "secret" {
+			t.Errorf("token header %q", r.Header.Get("X-QNZS-Internal-Token"))
+		}
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n")
+	}))
+	defer upstream.Close()
+	runner := &HTTPCanvasRunner{URL: upstream.URL, Token: "secret", Client: upstream.Client()}
+	out, err := runner.Run(context.Background(), RunRequest{
+		TenantID:  "tenant-1",
+		AgentID:   "agent-1",
+		SessionID: "s-agent-1",
+		Query:     "not-sent-separately",
+		Inputs:    map[string]BeginInput{"customer.name": {Name: "customer.name", Value: "should-not-send"}},
+		Raw: map[string]any{
+			"query":      "故宫在哪",
+			"customer":   map[string]any{"name": "张三"},
+			"session_id": "replaced",
+			"dialog":     []any{map[string]any{"role": "user", "content": "hi"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contents []string
+	for content := range out {
+		contents = append(contents, content)
+	}
+	if strings.Join(contents, "") != "你好" {
+		t.Fatalf("contents %#v", contents)
+	}
+	if got["tenant_id"] != "tenant-1" || got["agent_id"] != "agent-1" || got["session_id"] != "s-agent-1" {
+		t.Fatalf("ids %#v", got)
+	}
+	if got["query"] != "故宫在哪" {
+		t.Fatalf("query %#v", got["query"])
+	}
+	if _, ok := got["inputs"]; ok {
+		t.Fatalf("inputs must stay out of the qnzs_completion kwargs: %#v", got["inputs"])
+	}
+	customer, _ := got["customer"].(map[string]any)
+	if customer["name"] != "张三" {
+		t.Fatalf("customer %#v", got["customer"])
+	}
+	dialog, _ := got["dialog"].([]any)
+	if len(dialog) != 1 {
+		t.Fatalf("dialog %#v", got["dialog"])
 	}
 }
 

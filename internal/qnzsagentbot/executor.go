@@ -28,7 +28,10 @@ import (
 	"time"
 )
 
-// RunRequest is one canvas execution after auth, ownership, and input mapping.
+// RunRequest is one canvas execution after auth and ownership checks.
+// Raw is the caller's JSON object with session_id already suffixed. The HTTP
+// runner forwards that object so qnzs_completion can map begin inputs itself.
+// Inputs and Dialog stay on the request for the Go mapping tests.
 type RunRequest struct {
 	TenantID  string
 	AgentID   string
@@ -38,6 +41,7 @@ type RunRequest struct {
 	Inputs    map[string]BeginInput
 	Dialog    []DialogTurn
 	HasDialog bool
+	Raw       map[string]any
 }
 
 // CanvasRunner executes the agent canvas. The production implementation calls
@@ -53,26 +57,20 @@ type HTTPCanvasRunner struct {
 	Client *http.Client
 }
 
-// Run posts the prepared request and streams message contents.
+// Run posts the original kwargs to qnzs_completion and streams message text.
+// The Go-mapped Inputs field is not sent: a caller field named inputs must
+// reach Python unchanged, and qnzs_completion rebuilds begin inputs from kwargs.
 func (r *HTTPCanvasRunner) Run(ctx context.Context, req RunRequest) (<-chan string, error) {
 	if r == nil || r.URL == "" || r.Token == "" {
 		return nil, dataError("canvas executor is not configured")
 	}
-	body := map[string]any{
-		"tenant_id":  req.TenantID,
-		"agent_id":   req.AgentID,
-		"session_id": req.SessionID,
-		"query":      req.Query,
-		"user_id":    req.UserID,
-		"inputs":     req.Inputs,
+	body := map[string]any{}
+	for key, value := range req.Raw {
+		body[key] = value
 	}
-	if req.HasDialog {
-		dialog := make([]map[string]string, 0, len(req.Dialog))
-		for _, turn := range req.Dialog {
-			dialog = append(dialog, map[string]string{"role": turn.Role, "content": turn.Content})
-		}
-		body["dialog"] = dialog
-	}
+	body["tenant_id"] = req.TenantID
+	body["agent_id"] = req.AgentID
+	body["session_id"] = req.SessionID
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -128,20 +126,8 @@ func readMessageContents(ctx context.Context, body io.Reader, out chan<- string)
 		if payload == "" || payload == "[DONE]" {
 			return nil
 		}
-		var event struct {
-			Event string `json:"event"`
-			Data  struct {
-				Content any `json:"content"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			return nil
-		}
-		if event.Event != "message" && event.Event != "error" {
-			return nil
-		}
-		content, ok := event.Data.Content.(string)
-		if !ok || content == "" {
+		content, ok := contentFromSSEPayload(payload)
+		if !ok {
 			return nil
 		}
 		select {
@@ -170,4 +156,38 @@ func readMessageContents(ctx context.Context, body io.Reader, out chan<- string)
 		return err
 	}
 	return flush()
+}
+
+// contentFromSSEPayload reads one SSE data payload.
+// qnzs_completion yields OpenAI chat.completion.chunk frames. The older
+// canvas event shape is still accepted so a message or error content string
+// is not dropped.
+func contentFromSSEPayload(payload string) (string, bool) {
+	var event struct {
+		Event  string `json:"event"`
+		Object string `json:"object"`
+		Data   struct {
+			Content any `json:"content"`
+		} `json:"data"`
+		Choices []struct {
+			Delta struct {
+				Content any `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return "", false
+	}
+	if event.Object == "chat.completion.chunk" {
+		if len(event.Choices) == 0 {
+			return "", false
+		}
+		content, ok := event.Choices[0].Delta.Content.(string)
+		return content, ok && content != ""
+	}
+	if event.Event != "message" && event.Event != "error" {
+		return "", false
+	}
+	content, ok := event.Data.Content.(string)
+	return content, ok && content != ""
 }
