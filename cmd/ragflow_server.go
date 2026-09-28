@@ -39,6 +39,7 @@ import (
 	"ragflow/internal/handler"
 	"ragflow/internal/ingestion/knowledge_compile"
 	ingestion "ragflow/internal/ingestion/service"
+	"ragflow/internal/qnzsagentbot"
 	agentic_rag "ragflow/internal/rag/agentic-rag"
 	"ragflow/internal/router"
 	"ragflow/internal/server/local"
@@ -1223,6 +1224,7 @@ func startServer(ctx context.Context, serverName string, arguments *serverArgs) 
 
 	// Setup routes
 	r.Setup(ginEngine)
+	registerQNZSAgentbot(ginEngine, agentService)
 
 	_, err := channels.Start(ctx)
 	if err != nil {
@@ -1476,6 +1478,21 @@ func registerNativeDeepDoc(arguments *serverArgs) {
 	common.Info("in-process DeepDoc inference limit registered",
 		zap.Int("max_concurrent_inference", budget),
 		zap.Int("gomaxprocs", goruntime.GOMAXPROCS(0)))
+}
+
+// registerQNZSAgentbot mounts POST /agentbots/:agent_id/chat/completions on the
+// API server. Auth, session suffix, and OpenAI SSE live in qnzsagentbot.
+// Canvas execution is the same AgentService runner as the other agentbot route.
+func registerQNZSAgentbot(engine *gin.Engine, agentService *service.AgentService) {
+	store := qnzsagentbot.NewGormStore(dao.DB)
+	svc := &qnzsagentbot.Service{
+		Tokens:   store,
+		Canvases: store,
+		Runner:   &service.QNZSCanvasRunner{Agents: agentService},
+	}
+	handler := svc.Handler()
+	engine.POST("/agentbots/:agent_id/chat/completions", gin.WrapH(handler))
+	engine.POST("/api/v1/agentbots/:agent_id/chat/completions", gin.WrapH(handler))
 }
 
 // logTokenizerCounters reports, once at startup, which embedding tokenizers this process

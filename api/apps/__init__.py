@@ -380,12 +380,6 @@ from api.apps.backward_compat import register_backward_compat_routes
 
 register_backward_compat_routes(app)
 
-# Internal canvas runner for the standalone Go agentbot service.
-# Not part of the public /api/v1 surface.
-from api.qnzs.canvas_exec import bp as qnzs_canvas_bp
-
-app.register_blueprint(qnzs_canvas_bp, url_prefix="/internal/qnzs")
-
 
 @app.errorhandler(404)
 async def not_found(error):

@@ -117,6 +117,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		SessionID: sessionID,
 		Query:     RequestQuery(body),
 		UserID:    RequestUserID(body),
+		DSL:       canvas.DSL,
 		Inputs:    MapBeginInputs(BeginInputSchema(canvas.DSL), body),
 		Dialog:    dialog,
 		HasDialog: hasDialog,

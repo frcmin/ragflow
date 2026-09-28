@@ -22,14 +22,8 @@ import (
 	"encoding/json"
 	"errors"
 
-	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
-
-// OpenMySQL opens the shared RAGFlow metadata database.
-func OpenMySQL(dsn string) (*gorm.DB, error) {
-	return gorm.Open(mysql.Open(dsn), &gorm.Config{})
-}
 
 // GormStore reads api_token and user_canvas. QNZSUserCanvasService is this
 // user_canvas table: there is no separate QNZS table in this fork.

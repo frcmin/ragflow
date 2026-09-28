@@ -19,7 +19,6 @@ package qnzsagentbot
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -123,6 +122,9 @@ func TestHandlerStreamAndMapping(t *testing.T) {
 	if runner.req.SessionID != "from-header-agent-1" || runner.req.TenantID != "tenant-1" || runner.req.Query != "问题" {
 		t.Fatalf("run request: %+v", runner.req)
 	}
+	if runner.req.DSL["components"] == nil {
+		t.Fatal("canvas DSL was not passed to the runner")
+	}
 	if runner.req.Raw["session_id"] != "from-header-agent-1" || runner.req.Raw["query"] != "问题" {
 		t.Fatalf("raw kwargs: %#v", runner.req.Raw)
 	}
@@ -200,118 +202,19 @@ func TestHandlerRejectsBadAuthAndForeignCanvas(t *testing.T) {
 	assertMessage("Bearer beta-key", msgAgentNotOwned)
 }
 
-func TestReadMessageContents(t *testing.T) {
-	raw := "data: {\"event\":\"workflow_started\",\"data\":{}}\n\n" +
-		"data: {\"event\":\"message\",\"data\":{\"content\":\"\"}}\n\n" +
-		"data: {\"event\":\"message\",\"data\":{\"content\":\"你好\"}}\n\n"
-	out := make(chan string, 4)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := readMessageContents(context.Background(), strings.NewReader(raw), out); err != nil {
-			t.Errorf("read: %v", err)
-		}
-		close(out)
-	}()
-	var got []string
-	for content := range out {
-		got = append(got, content)
+func TestContentFromCanvasEvent(t *testing.T) {
+	if _, ok := ContentFromCanvasEvent("workflow_started", `{"inputs":"x"}`); ok {
+		t.Fatal("workflow telemetry should be dropped")
 	}
-	<-done
-	if strings.Join(got, "") != "你好" {
-		t.Fatalf("got %#v", got)
+	if _, ok := ContentFromCanvasEvent("message", `{"content":""}`); ok {
+		t.Fatal("empty message should be dropped")
 	}
-}
-
-func TestReadOpenAIChunks(t *testing.T) {
-	raw := "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n" +
-		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"故宫\"}}]}\n\n" +
-		"data: {\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"content\":\"ignored\"}}]}\n\n" +
-		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"在北京\"}}]}\n\n"
-	out := make(chan string, 4)
-	if err := readMessageContents(context.Background(), strings.NewReader(raw), out); err != nil {
-		t.Fatal(err)
+	got, ok := ContentFromCanvasEvent("message", `{"content":"你好"}`)
+	if !ok || got != "你好" {
+		t.Fatalf("message content = %q ok=%v", got, ok)
 	}
-	close(out)
-	var got []string
-	for content := range out {
-		got = append(got, content)
-	}
-	if strings.Join(got, "") != "故宫在北京" {
-		t.Fatalf("got %#v", got)
-	}
-}
-
-func TestHTTPCanvasRunnerForwardsRawKwargs(t *testing.T) {
-	var got map[string]any
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-QNZS-Internal-Token") != "secret" {
-			t.Errorf("token header %q", r.Header.Get("X-QNZS-Internal-Token"))
-		}
-		defer r.Body.Close()
-		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-			t.Errorf("decode: %v", err)
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n")
-	}))
-	defer upstream.Close()
-	runner := &HTTPCanvasRunner{URL: upstream.URL, Token: "secret", Client: upstream.Client()}
-	out, err := runner.Run(context.Background(), RunRequest{
-		TenantID:  "tenant-1",
-		AgentID:   "agent-1",
-		SessionID: "s-agent-1",
-		Query:     "not-sent-separately",
-		Inputs:    map[string]BeginInput{"customer.name": {Name: "customer.name", Value: "should-not-send"}},
-		Raw: map[string]any{
-			"query":      "故宫在哪",
-			"customer":   map[string]any{"name": "张三"},
-			"session_id": "replaced",
-			"dialog":     []any{map[string]any{"role": "user", "content": "hi"}},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var contents []string
-	for content := range out {
-		contents = append(contents, content)
-	}
-	if strings.Join(contents, "") != "你好" {
-		t.Fatalf("contents %#v", contents)
-	}
-	if got["tenant_id"] != "tenant-1" || got["agent_id"] != "agent-1" || got["session_id"] != "s-agent-1" {
-		t.Fatalf("ids %#v", got)
-	}
-	if got["query"] != "故宫在哪" {
-		t.Fatalf("query %#v", got["query"])
-	}
-	if _, ok := got["inputs"]; ok {
-		t.Fatalf("inputs must stay out of the qnzs_completion kwargs: %#v", got["inputs"])
-	}
-	customer, _ := got["customer"].(map[string]any)
-	if customer["name"] != "张三" {
-		t.Fatalf("customer %#v", got["customer"])
-	}
-	dialog, _ := got["dialog"].([]any)
-	if len(dialog) != 1 {
-		t.Fatalf("dialog %#v", got["dialog"])
-	}
-}
-
-func TestHTTPCanvasRunnerStatusError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-QNZS-Internal-Token") != "secret" {
-			t.Errorf("token header %q", r.Header.Get("X-QNZS-Internal-Token"))
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = io.WriteString(w, `{"code":102,"message":"Agent not found."}`)
-	}))
-	defer upstream.Close()
-	runner := &HTTPCanvasRunner{URL: upstream.URL, Token: "secret", Client: upstream.Client()}
-	_, err := runner.Run(context.Background(), RunRequest{AgentID: "a"})
-	apiErr, ok := err.(*APIError)
-	if !ok || apiErr.Message != "Agent not found." {
-		t.Fatalf("err=%v", err)
+	got, ok = ContentFromCanvasEvent("error", `{"message":"Agent not found."}`)
+	if !ok || got != "Agent not found." {
+		t.Fatalf("error content = %q ok=%v", got, ok)
 	}
 }
